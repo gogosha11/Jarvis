@@ -26,6 +26,22 @@ import requests
 import speech_recognition as sr
 import pyttsx3
 from PySide6.QtCore import QSettings
+from dotenv import load_dotenv
+
+
+def _load_local_environment():
+    """Load a private .env placed next to the portable executable."""
+    locations = [
+        Path(sys.executable).resolve().parent / ".env",
+        Path(__file__).resolve().parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    for location in locations:
+        if location.exists():
+            load_dotenv(location, override=False)
+
+
+_load_local_environment()
 
 
 _EMBEDDED_SECRET_KEY = b"jarvis-local-build-2026"
@@ -60,7 +76,7 @@ _load_embedded_secrets()
 
 
 APP_TITLE = "Джарвис — голосовой ассистент"
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.7.0"
 try:
     JARVIS_VOLUME = float(os.getenv("JARVIS_VOLUME", "1.0"))
 except ValueError:
@@ -1858,7 +1874,10 @@ class AIResponder:
     }
 
     def __init__(self):
-        self.backend_url = ""
+        self.backend_url = os.getenv(
+            "JARVIS_BACKEND_URL",
+            "https://website-jarvis-production.up.railway.app",
+        ).strip().rstrip("/")
         self.gateway_token = ""
         self.ai_key = os.getenv("AI_API_KEY", "").strip()
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -1914,6 +1933,9 @@ class AIResponder:
             + "Запрос пользователя: "
             + command
         )
+        remote_answer = self._remote_reply(prompt)
+        if remote_answer:
+            return self._clean_spoken_reply(remote_answer)
         if self.mistral_key:
             answer = self._openai_compatible(
                 "https://api.mistral.ai/v1/chat/completions",
@@ -1961,7 +1983,7 @@ class AIResponder:
         except (requests.RequestException, ValueError, TypeError):
             return None
 
-    def remote_tts(self, text):
+    def remote_tts(self, text, voice_id=""):
         """Request generated Fish Audio speech without exposing its key."""
         if not self.backend_url:
             return None
@@ -1972,7 +1994,7 @@ class AIResponder:
             response = requests.post(
                 self.backend_url + "/jarvis/tts",
                 headers=headers,
-                json={"text": text},
+                json={"text": text, "voice_id": voice_id or ""},
                 timeout=70,
             )
             response.raise_for_status()
@@ -2243,6 +2265,50 @@ class VoiceWorker:
         self.on_status(f"В папке голосов нет рабочей фразы «{category}».")
         return False
 
+    def _play_mp3_bytes(self, audio_bytes, run_event):
+        audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="jarvis_remote_", suffix=".mp3", delete=False
+            ) as audio_file:
+                audio_path = audio_file.name
+                audio_file.write(audio_bytes)
+            if run_event.is_set() or self.stop_event.is_set():
+                return
+            ffplay = shutil.which("ffplay")
+            if ffplay:
+                process = subprocess.Popen(
+                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                while process.poll() is None:
+                    if run_event.is_set() or self.stop_event.is_set():
+                        process.terminate()
+                        break
+                    time.sleep(0.1)
+                return
+            if self.voice_library.mixer_ready:
+                self.voice_library.mixer.music.load(audio_path)
+                self.voice_library.mixer.music.play()
+                while (
+                    self.voice_library.mixer.music.get_busy()
+                    and not self.stop_event.is_set()
+                    and not run_event.is_set()
+                ):
+                    time.sleep(0.1)
+                if run_event.is_set():
+                    self.voice_library.mixer.music.stop()
+                return
+            raise RuntimeError("не найден проигрыватель MP3")
+        finally:
+            if audio_path:
+                try:
+                    Path(audio_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def say(self, text, category=None):
         self.on_reply(text)
         # Preset clips are only for the local Jarvis voice.  When another
@@ -2255,6 +2321,13 @@ class VoiceWorker:
                 f"Файл голоса для категории «{category}» не воспроизведён — "
                 "использую стандартный голос."
             )
+        remote_audio = self.ai.remote_tts(text, selected_voice)
+        if remote_audio:
+            try:
+                self._play_mp3_bytes(remote_audio, threading.Event())
+                return
+            except Exception as exc:
+                self.on_status(f"Удалённый голос недоступен ({exc}). Использую резерв.")
         fish_key = os.getenv("FISH_AUDIO_API_KEY", "").strip()
         # Empty selection keeps the original local Jarvis voice.  A selected
         # profile uses its Fish Audio reference ID for generated replies.
@@ -2394,34 +2467,11 @@ class VoiceWorker:
         run_event = run_event or self.news_stop_event
         # The generic remote TTS endpoint has the old Jarvis voice.  It must
         # not run when the user selected a specific Fish Audio profile.
-        remote_audio = None if selected_voice else self.ai.remote_tts(text)
+        remote_audio = self.ai.remote_tts(text, selected_voice)
         if remote_audio:
             try:
-                with tempfile.NamedTemporaryFile(
-                    prefix="jarvis_remote_", suffix=".mp3", delete=False
-                ) as audio_file:
-                    audio_path = audio_file.name
-                    audio_file.write(remote_audio)
-                if run_event.is_set() or self.stop_event.is_set():
-                    return
-                ffplay = shutil.which("ffplay")
-                if ffplay:
-                    process = subprocess.Popen(
-                        [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                    with self.news_process_lock:
-                        self.news_process = process
-                    while process.poll() is None:
-                        if run_event.is_set() or self.stop_event.is_set():
-                            process.terminate()
-                            break
-                        time.sleep(0.1)
-                    with self.news_process_lock:
-                        self.news_process = None
-                    return
+                self._play_mp3_bytes(remote_audio, run_event)
+                return
             except Exception as exc:
                 self.on_status(f"Удалённый голос недоступен: {exc}. Использую обычный голос.")
             finally:

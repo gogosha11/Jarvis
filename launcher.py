@@ -28,7 +28,7 @@ UPDATE_API_URL = os.getenv(
     "JARVIS_UPDATE_API_URL",
     f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
 )
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.7.0"
 
 
 class WaveBackground(QWidget):
@@ -548,8 +548,17 @@ class Launcher(QWidget):
         self.microphone.addItem("Микрофон по умолчанию", "")
         try:
             import speech_recognition as sr
+            seen = set()
+            hidden_markers = (
+                "stereo mix", "what u hear", "virtual cable", "voicemeeter",
+                "vb-audio", "cable output", "steam streaming", "remote audio",
+            )
             for index, name in enumerate(sr.Microphone.list_microphone_names()):
                 label = name.strip() or f"Микрофон {index}"
+                normalized = " ".join(label.casefold().split())
+                if normalized in seen or any(marker in normalized for marker in hidden_markers):
+                    continue
+                seen.add(normalized)
                 self.microphone.addItem(f"{index}: {label}", str(index))
         except Exception as error:
             self.microphone.addItem(f"Не удалось получить список: {error}", "")
