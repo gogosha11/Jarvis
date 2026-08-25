@@ -28,7 +28,7 @@ UPDATE_API_URL = os.getenv(
     "JARVIS_UPDATE_API_URL",
     f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
 )
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 
 
 class WaveBackground(QWidget):
@@ -481,6 +481,10 @@ class Launcher(QWidget):
         nickname = QLabel("gogosha_blender")
         nickname.setStyleSheet("color:#8ea6cc; font-size:11px;")
         header.addWidget(nickname)
+        header.addSpacing(15)
+        version = QLabel(f"v{APP_VERSION}")
+        version.setStyleSheet("color:#65d9ff; font-size:11px; font-weight:700;")
+        header.addWidget(version)
         header.addSpacing(15)
         mode = QLabel("локальная система  ︱  JARVIS PRO")
         mode.setStyleSheet("color:#7385a5; font-size:11px;")
