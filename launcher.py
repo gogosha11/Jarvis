@@ -28,7 +28,7 @@ UPDATE_API_URL = os.getenv(
     "JARVIS_UPDATE_API_URL",
     f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
 )
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.6.4"
 
 
 class WaveBackground(QWidget):
@@ -385,24 +385,24 @@ class Launcher(QWidget):
         overlay.setGeometry(self.rect())
         overlay.raise_()
         close_button = QPushButton("×", overlay)
-        close_button.setFixedSize(38, 38)
+        close_button.setFixedSize(52, 52)
         close_button.setStyleSheet(
             "QPushButton { color:#a8b8d6; background:transparent; border:0; "
-             "font-size:24px; font-weight:300; padding-bottom:10px; }"
+             "font-size:30px; font-weight:300; padding-bottom:10px; }"
             "QPushButton:hover { color:white; background:rgba(225,70,100,150); border-radius:7px; }"
         )
         close_button.clicked.connect(self.close)
         minimize_button = QPushButton("—", overlay)
-        minimize_button.setFixedSize(38, 38)
+        minimize_button.setFixedSize(52, 52)
         minimize_button.setStyleSheet(
-             "QPushButton { color:#a8b8d6; background:transparent; border:0; font-size:17px; padding-bottom:10px; }"
+             "QPushButton { color:#a8b8d6; background:transparent; border:0; font-size:22px; padding-bottom:10px; }"
             "QPushButton:hover { color:white; background:rgba(80,120,180,130); border-radius:7px; }"
         )
         minimize_button.clicked.connect(self.showMinimized)
 
         def resize_overlay(event):
-            close_button.move(overlay.width() - 52, 12)
-            minimize_button.move(overlay.width() - 94, 12)
+            close_button.move(overlay.width() - 64, 8)
+            minimize_button.move(overlay.width() - 116, 8)
             QWidget.resizeEvent(overlay, event)
 
         overlay.resizeEvent = resize_overlay
@@ -590,6 +590,7 @@ class Launcher(QWidget):
             ("Рик", "fcb391ebe91a438d9c810ae17cde81de"),
             ("Морти", "3674e320208a4da19becbea85d993d6e"),
             ("Губка Боб", "a2acc0d939984f5a96edd720d5564d44"),
+            ("Акаши Сейджеро", "bbaa4aa0c14d4011a3cae43a6d53b130"),
         )
         for name, voice_id in self.voice_profiles:
             self.voice_choice.addItem(name, voice_id)

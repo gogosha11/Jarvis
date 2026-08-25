@@ -60,7 +60,7 @@ _load_embedded_secrets()
 
 
 APP_TITLE = "Джарвис — голосовой ассистент"
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.6.4"
 try:
     JARVIS_VOLUME = float(os.getenv("JARVIS_VOLUME", "1.0"))
 except ValueError:
