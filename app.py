@@ -76,7 +76,7 @@ _load_embedded_secrets()
 
 
 APP_TITLE = "Джарвис — голосовой ассистент"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.3"
 try:
     JARVIS_VOLUME = float(os.getenv("JARVIS_VOLUME", "1.0"))
 except ValueError:
@@ -326,6 +326,86 @@ def is_conversational_phrase(text):
         "доброе утро", "добрый день", "добрый вечер", "привет",
         "здравствуй",
     ))
+
+
+class SpeechTranscriber:
+    """Recognize commands with Groq Whisper and keep Google as a fallback."""
+
+    GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+    def __init__(self, recognizer, on_status=None):
+        self.recognizer = recognizer
+        self.on_status = on_status
+        self.groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        self.groq_model = os.getenv(
+            "GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"
+        ).strip() or "whisper-large-v3-turbo"
+        self.language = os.getenv("JARVIS_STT_LANGUAGE", "ru").strip() or "ru"
+        self.groq_retry_after = 0.0
+        self._fallback_notice_sent = False
+
+    @property
+    def provider_label(self):
+        if self.groq_key:
+            return f"Groq Whisper ({self.groq_model}) + Google fallback"
+        return "Google fallback (GROQ_API_KEY не найден)"
+
+    def transcribe(self, audio):
+        """Return recognized text, preferring the fast multilingual Whisper API."""
+        if self.groq_key and time.monotonic() >= self.groq_retry_after:
+            try:
+                wav_data = audio.get_wav_data(
+                    convert_rate=16000,
+                    convert_width=2,
+                )
+                response = requests.post(
+                    self.GROQ_ENDPOINT,
+                    headers={"Authorization": f"Bearer {self.groq_key}"},
+                    files={
+                        "file": (
+                            "jarvis-command.wav",
+                            wav_data,
+                            "audio/wav",
+                        )
+                    },
+                    data={
+                        "model": self.groq_model,
+                        "language": self.language,
+                        "response_format": "json",
+                        "temperature": "0",
+                        "prompt": (
+                            "Русская речь голосового ассистента. "
+                            "Ключевое слово: Джарвис. Частые названия: "
+                            "Яндекс Музыка, YouTube, Visual Studio, Blender, "
+                            "Steam, TikTok. Не добавляй пояснений."
+                        ),
+                    },
+                    timeout=15,
+                )
+                response.raise_for_status()
+                text = str(response.json().get("text", "")).strip()
+                if text:
+                    self._fallback_notice_sent = False
+                    return text
+            except (
+                requests.RequestException,
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                AttributeError,
+            ):
+                # Avoid waiting for a broken key/network connection on every
+                # phrase. Google remains available as the compatibility path.
+                self.groq_retry_after = time.monotonic() + 30
+                if not self._fallback_notice_sent and self.on_status:
+                    self.on_status(
+                        "Groq Whisper временно недоступен. "
+                        "Использую резервное распознавание Google."
+                    )
+                    self._fallback_notice_sent = True
+
+        return self.recognizer.recognize_google(audio, language="ru-RU")
 
 
 class VoiceLibrary:
@@ -1874,10 +1954,9 @@ class AIResponder:
     }
 
     def __init__(self):
-        self.backend_url = os.getenv(
-            "JARVIS_BACKEND_URL",
-            "https://website-jarvis-production.up.railway.app",
-        ).strip().rstrip("/")
+        # Private/local builds use the embedded keys first. Railway is an
+        # optional fallback only when explicitly configured.
+        self.backend_url = os.getenv("JARVIS_BACKEND_URL", "").strip().rstrip("/")
         self.gateway_token = ""
         self.ai_key = os.getenv("AI_API_KEY", "").strip()
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -2206,6 +2285,11 @@ class VoiceWorker:
         self.stop_event = threading.Event()
         self.thread = None
         self.recognizer = sr.Recognizer()
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.65
+        self.recognizer.phrase_threshold = 0.2
+        self.recognizer.non_speaking_duration = 0.35
+        self.transcriber = SpeechTranscriber(self.recognizer, self.on_status)
         self.ai = AIResponder()
         self.voice_library = VoiceLibrary()
         fish_ready = bool(
@@ -2217,6 +2301,7 @@ class VoiceWorker:
         )
         fish_label = "Fish Audio настроен" if fish_ready else "Fish Audio не настроен"
         self.on_status(f"{self.ai.configuration_status()}; {fish_label}")
+        self.on_status(f"Распознавание речи: {self.transcriber.provider_label}")
         self.on_status(f"Голоса Джарвиса: {self.voice_library.summary()}")
         self.active_project = None
         self.active_source = None
@@ -2880,9 +2965,7 @@ class VoiceWorker:
                     try:
                         listen_started = time.monotonic()
                         audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=8)
-                        heard = self.recognizer.recognize_google(
-                            audio, language="ru-RU"
-                        ).strip()
+                        heard = self.transcriber.transcribe(audio).strip()
                         wake_found, wake_command = extract_wake_command(heard)
                         # Recognition is a network operation.  If Google
                         # returns a result a little after the deadline, it
@@ -3449,10 +3532,16 @@ class App(tk.Tk):
     def _test_microphone_worker(self, device_index):
         try:
             recognizer = sr.Recognizer()
+            recognizer.dynamic_energy_threshold = True
+            recognizer.pause_threshold = 0.65
+            recognizer.phrase_threshold = 0.2
+            recognizer.non_speaking_duration = 0.35
+            transcriber = SpeechTranscriber(recognizer, self.set_status)
             with sr.Microphone(device_index=device_index) as source:
                 self.set_status("Проверка микрофона: скажите что-нибудь…")
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = recognizer.listen(source, timeout=4, phrase_time_limit=4)
-            text = recognizer.recognize_google(audio, language="ru-RU")
+            text = transcriber.transcribe(audio)
             self.set_status(f"Микрофон работает: «{text}»")
         except sr.WaitTimeoutError:
             self.set_status("Микрофон открыт, но звук не найден. Проверьте разрешение Windows.")
