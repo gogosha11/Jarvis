@@ -34,17 +34,8 @@ UPDATE_API_URL = os.getenv(
     "JARVIS_UPDATE_API_URL",
     f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
 )
-APP_VERSION = "2.8.4"
-DEFAULT_AUTH_URL = "https://website-jarvis-production.up.railway.app"
-
-
-def _auth_url():
-    """Return the cloud account service without blocking the Qt thread."""
-    return (
-        os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
-        or os.getenv("JARVIS_BACKEND_URL", "").strip().rstrip("/")
-        or DEFAULT_AUTH_URL
-    )
+APP_VERSION = "2.9.0"
+WINDOW_BUTTON_SIZE = 43
 
 
 def _password_digest(password, salt=None):
@@ -68,7 +59,7 @@ def _password_matches(password, stored):
 class AuthDialog(QDialog):
     """A styled two-step account screen with optional email delivery."""
 
-    verification_result = Signal(bool, str, str)
+    verification_result = Signal(bool, str)
     backend_result = Signal(bool, str)
     backend_login_result = Signal(bool, str)
     profile_ready = Signal(dict)
@@ -121,10 +112,10 @@ class AuthDialog(QDialog):
         top.addWidget(brand)
         top.addStretch()
         close = QPushButton("×")
-        close.setFixedSize(30, 30)
+        close.setFixedSize(20, 20)
         close.setStyleSheet(
             "QPushButton { color:#8ea6cc; background:transparent; border:0; "
-            "font-size:24px; padding:0; } QPushButton:hover { color:white; "
+             "font-size:16px; padding:0; } QPushButton:hover { color:white; "
             "background:rgba(225,70,100,150); border-radius:7px; }"
         )
         close.clicked.connect(self.reject)
@@ -207,7 +198,7 @@ class AuthDialog(QDialog):
         layout.addWidget(self.status)
         layout.addStretch()
         footer = QLabel(
-            "Аккаунт хранится в облачном профиле Jarvis и доступен с другого компьютера."
+            "Данные аккаунта хранятся в профиле этого устройства."
             if self.mode == "register"
             else "Если это не ваш аккаунт, выйдите из него в разделе «Аккаунт»."
         )
@@ -221,24 +212,9 @@ class AuthDialog(QDialog):
         self.mode = mode
         self.pending_code = ""
         self.setFixedSize(560, 760 if mode == "register" else 505)
-        old_card = getattr(self, "card", None)
-        if old_card is not None:
-            old_card.hide()
-            # Do not detach/delete the only child of a frameless modal dialog
-            # while its button click is being dispatched. On Windows that can
-            # close the native dialog and leave the launcher behind a modal
-            # event loop. Keeping the hidden card until the dialog is closed
-            # makes switching modes deterministic.
+        if hasattr(self, "card"):
+            self.card.deleteLater()
         self.build_ui()
-        # A child created after QDialog.exec() has started is hidden by
-        # default. Explicitly show and activate the replacement card; without
-        # this the transparent dialog remains modal while its new form is
-        # invisible behind the launcher.
-        self.card.show()
-        self.card.raise_()
-        self.raise_()
-        self.activateWindow()
-        self.setFocus()
 
     def _apply_mode_styles(self):
         active = (
@@ -290,9 +266,7 @@ class AuthDialog(QDialog):
         if password != repeated:
             self._set_status("Пароли не совпадают.", "#ff9da8")
             return
-        remote = bool(_auth_url())
-        self.remote_registration = remote
-        self.pending_code = "" if remote else f"{secrets.randbelow(1_000_000):06d}"
+        self.pending_code = f"{secrets.randbelow(1_000_000):06d}"
         self.code_expires = time.time() + 600
         self.send_button.setEnabled(False)
         self._set_status("Отправляю код подтверждения…")
@@ -304,22 +278,15 @@ class AuthDialog(QDialog):
 
     def _send_code_worker(self, email, nickname, code):
         try:
-            auth_url = _auth_url()
+            auth_url = os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
             if auth_url:
                 response = requests.post(
                     f"{auth_url}/api/auth/send-code",
-                    json={"email": email, "nickname": nickname},
+                    json={"email": email, "nickname": nickname, "code": code},
                     timeout=15,
                 )
                 response.raise_for_status()
-                payload = response.json() if response.content else {}
-                dev_code = str(payload.get("devCode") or "")
-                message = (
-                    "Код отправлен на вашу почту."
-                    if not dev_code
-                    else f"Почта не настроена на сервере — код для проверки: {dev_code}"
-                )
-                self.verification_result.emit(True, message, dev_code)
+                self.verification_result.emit(True, "Код отправлен на вашу почту.")
                 return
             smtp_host = os.getenv("JARVIS_SMTP_HOST", "").strip()
             if smtp_host:
@@ -352,17 +319,18 @@ class AuthDialog(QDialog):
                             os.getenv("JARVIS_SMTP_PASSWORD", ""),
                         )
                         server.send_message(message)
-                self.verification_result.emit(True, "Код отправлен на вашу почту.", "")
+                self.verification_result.emit(True, "Код отправлен на вашу почту.")
                 return
-            self.verification_result.emit(True, f"Локальный код для проверки: {code}", code)
+            self.verification_result.emit(
+                True,
+                f"Почта не подключена — локальный код для проверки: {code}",
+            )
         except (OSError, ValueError, requests.RequestException, smtplib.SMTPException) as error:
-            self.verification_result.emit(False, f"Не удалось отправить письмо: {error}", "")
+            self.verification_result.emit(False, f"Не удалось отправить письмо: {error}")
 
-    def _email_result(self, success, message, received_code=""):
+    def _email_result(self, success, message):
         if not hasattr(self, "send_button"):
             return
-        if received_code:
-            self.pending_code = received_code
         self.send_button.setEnabled(True)
         if success:
             self.code_panel.setVisible(True)
@@ -376,11 +344,7 @@ class AuthDialog(QDialog):
         if time.time() > self.code_expires:
             self._set_status("Срок действия кода истёк. Запросите новый код.", "#ff9da8")
             return
-        entered_code = self.code.text().strip()
-        if not re.fullmatch(r"\d{6}", entered_code):
-            self._set_status("Введите 6 цифр из письма.", "#ff9da8")
-            return
-        if not getattr(self, "remote_registration", False) and entered_code != self.pending_code:
+        if self.code.text().strip() != self.pending_code:
             self._set_status("Код введён неверно.", "#ff9da8")
             return
         profile = {
@@ -388,7 +352,7 @@ class AuthDialog(QDialog):
             "nickname": self.nickname.text().strip(),
             "password_hash": _password_digest(self.password.text()),
         }
-        auth_url = _auth_url()
+        auth_url = os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
         if auth_url:
             self.pending_profile = profile
             self.finish_button.setEnabled(False)
@@ -404,7 +368,7 @@ class AuthDialog(QDialog):
 
     def _register_backend_worker(self, profile, password, code):
         try:
-            auth_url = _auth_url()
+            auth_url = os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
             response = requests.post(
                 f"{auth_url}/api/auth/register",
                 json={
@@ -415,12 +379,7 @@ class AuthDialog(QDialog):
                 },
                 timeout=15,
             )
-            if not response.ok:
-                try:
-                    detail = response.json().get("error")
-                except (ValueError, TypeError):
-                    detail = None
-                raise requests.RequestException(detail or f"HTTP {response.status_code}")
+            response.raise_for_status()
             self.backend_result.emit(True, "Аккаунт создан. Добро пожаловать в JARVIS.")
         except (OSError, ValueError, requests.RequestException) as error:
             self.backend_result.emit(
@@ -443,7 +402,7 @@ class AuthDialog(QDialog):
         if not email or not password:
             self._set_status("Введите email и пароль.", "#ff9da8")
             return
-        auth_url = _auth_url()
+        auth_url = os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
         if auth_url:
             self.login_button.setEnabled(False)
             self._set_status("Проверяю данные аккаунта…")
@@ -465,18 +424,13 @@ class AuthDialog(QDialog):
 
     def _login_backend_worker(self, email, password):
         try:
-            auth_url = _auth_url()
+            auth_url = os.getenv("JARVIS_AUTH_URL", "").strip().rstrip("/")
             response = requests.post(
                 f"{auth_url}/api/auth/login",
                 json={"email": email, "password": password},
                 timeout=15,
             )
-            if not response.ok:
-                try:
-                    detail = response.json().get("error")
-                except (ValueError, TypeError):
-                    detail = None
-                raise requests.RequestException(detail or f"HTTP {response.status_code}")
+            response.raise_for_status()
             payload = response.json() if response.content else {}
             user = payload.get("user", payload) if isinstance(payload, dict) else {}
             self.remote_profile = {
@@ -1094,17 +1048,17 @@ Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
         overlay.setGeometry(self.rect())
         overlay.raise_()
         self.close_button = QPushButton("×", self)
-        self.close_button.setFixedSize(64, 64)
+        self.close_button.setFixedSize(WINDOW_BUTTON_SIZE, WINDOW_BUTTON_SIZE)
         self.close_button.setStyleSheet(
             "QPushButton { color:#a8b8d6; background:transparent; border:0; "
-             "font-size:30px; font-weight:300; padding-bottom:10px; }"
+             "font-size:20px; font-weight:300; padding-bottom:6px; }"
             "QPushButton:hover { color:white; background:rgba(225,70,100,150); border-radius:7px; }"
         )
         self.close_button.clicked.connect(self.close)
         self.minimize_button = QPushButton("—", self)
-        self.minimize_button.setFixedSize(64, 64)
+        self.minimize_button.setFixedSize(WINDOW_BUTTON_SIZE, WINDOW_BUTTON_SIZE)
         self.minimize_button.setStyleSheet(
-             "QPushButton { color:#a8b8d6; background:transparent; border:0; font-size:22px; padding-bottom:10px; }"
+             "QPushButton { color:#a8b8d6; background:transparent; border:0; font-size:16px; padding-bottom:6px; }"
             "QPushButton:hover { color:white; background:rgba(80,120,180,130); border-radius:7px; }"
         )
         self.minimize_button.clicked.connect(self.showMinimized)
@@ -1167,8 +1121,12 @@ Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
         super().resizeEvent(event)
 
     def _position_window_buttons(self):
-        self.close_button.move(self.width() - 72, 4)
-        self.minimize_button.move(self.width() - 136, 4)
+        gap = 5
+        right_margin = 7
+        self.close_button.move(self.width() - WINDOW_BUTTON_SIZE - right_margin, 5)
+        self.minimize_button.move(
+            self.width() - (WINDOW_BUTTON_SIZE * 2) - gap - right_margin, 5
+        )
 
     def nav_button(self, text, active=False):
         button = QPushButton(text)

@@ -1,6 +1,7 @@
 import hashlib
 import base64
 import asyncio
+import difflib
 import json
 import os
 import random
@@ -76,7 +77,7 @@ _load_embedded_secrets()
 
 
 APP_TITLE = "Джарвис — голосовой ассистент"
-APP_VERSION = "2.8.3"
+APP_VERSION = "2.9.0"
 try:
     JARVIS_VOLUME = float(os.getenv("JARVIS_VOLUME", "1.0"))
 except ValueError:
@@ -241,9 +242,21 @@ def extract_wake_command(text):
         rf"(?<!\w){re.escape(configured.casefold())}(?!\w)",
         (text or "").casefold(),
     )
-    if not match:
-        return False, ""
-    return True, (text or "")[match.end():].strip(" ,.!?-")
+    if match:
+        return True, (text or "")[match.end():].strip(" ,.!?-")
+
+    # Whisper/Google occasionally turn «Джарвис» into «Жарвис» or
+    # «Джервис».  Only inspect the first few words, so a similar word in the
+    # middle of an ordinary sentence cannot activate the assistant by accident.
+    configured_key = re.sub(r"[^а-яёa-z0-9]", "", configured.casefold())
+    words = list(re.finditer(r"[а-яёa-z0-9-]+", (text or "").casefold()))
+    for candidate in words[:3]:
+        candidate_key = re.sub(r"[^а-яёa-z0-9]", "", candidate.group())
+        if len(candidate_key) >= 4 and difflib.SequenceMatcher(
+            None, configured_key, candidate_key
+        ).ratio() >= 0.72:
+            return True, (text or "")[candidate.end():].strip(" ,.!?-")
+    return False, ""
 
 
 def media_command(command):
@@ -675,15 +688,21 @@ def find_start_menu_shortcut(words):
         Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Microsoft/Windows/Start Menu/Programs",
     ]
     wanted = [word.casefold() for word in words if word]
+    if not wanted:
+        return None
     candidates = []
     for root in roots:
         if not root.exists():
             continue
         try:
             for shortcut in root.rglob("*.lnk"):
-                name = shortcut.stem.lower()
-                if all(word.lower() in name for word in wanted):
-                    candidates.append(shortcut)
+                name = shortcut.stem.casefold()
+                score = sum(
+                    1 for word in wanted
+                    if word in name or difflib.SequenceMatcher(None, word, name).ratio() >= 0.78
+                )
+                if score == len(wanted):
+                    candidates.append((score, shortcut))
         except OSError:
             continue
     if not candidates:
@@ -691,10 +710,89 @@ def find_start_menu_shortcut(words):
     # Prefer an exact shortcut title. This prevents a fuzzy search from
     # accidentally opening an unrelated app when Windows has many shortcuts.
     wanted_name = " ".join(wanted).lower()
-    for shortcut in candidates:
+    candidates.sort(key=lambda item: (item[0], len(item[1].stem)))
+    for _, shortcut in candidates:
         if shortcut.stem.lower().strip() == wanted_name:
             return shortcut
-    return candidates[0]
+    return candidates[0][1]
+
+
+def _windows_path_candidates(*relative_paths):
+    """Expand common Windows install roots without using a shell."""
+    roots = (
+        Path(os.environ.get("LOCALAPPDATA", "")),
+        Path(os.environ.get("APPDATA", "")),
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")),
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("USERPROFILE", "")),
+    )
+    result = []
+    for relative in relative_paths:
+        relative = str(relative)
+        if Path(relative).is_absolute():
+            result.append(Path(relative))
+            continue
+        for root in roots:
+            if str(root):
+                result.append(root / relative)
+    return result
+
+
+def _first_existing_path(patterns):
+    """Return the first executable found, including one-level wildcards."""
+    for pattern in patterns:
+        if not pattern:
+            continue
+        path = Path(pattern)
+        try:
+            if path.is_file():
+                return path
+            if any(char in str(path) for char in "*?["):
+                matches = sorted(path.parent.glob(path.name))
+                for match in matches:
+                    if match.is_file():
+                        return match
+        except OSError:
+            continue
+    return None
+
+
+def _launch_executable(path, *arguments):
+    try:
+        subprocess.Popen(
+            [str(path), *[str(argument) for argument in arguments]],
+            cwd=str(Path(path).resolve().parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _launch_windows_store_app(name):
+    """Launch a Store app through its registered AppsFolder identity."""
+    if os.name != "nt":
+        return False
+    try:
+        safe_name = str(name).replace("'", "''")
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                (
+                    "$app=Get-StartApps | Where-Object {$_.Name -like "
+                    f"'*{safe_name}*'}} | Select-Object -First 1; "
+                    "if ($app) { Start-Process ('shell:AppsFolder\\' + $app.AppID); exit 0 } "
+                    "exit 1"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def first_video_url(query, youtube_only=False):
@@ -1681,8 +1779,11 @@ def open_local_app(command):
     text = command.lower().strip()
     if "давай поработаем" in text:
         if os.name == "nt" and DEFAULT_WORK_PROJECT.is_file():
-            os.startfile(str(DEFAULT_WORK_PROJECT))
-            return True, jarvis_ack("открываю первый проект Visual Studio", 1)
+            try:
+                os.startfile(str(DEFAULT_WORK_PROJECT))
+                return True, jarvis_ack("открываю первый проект Visual Studio", 1)
+            except OSError:
+                pass
         return False, f"Проект Visual Studio не найден: {DEFAULT_WORK_PROJECT}"
     # A YouTube destination always wins over an application name inside the
     # query: "включи на YouTube Dota 2" must play a video, not launch Steam.
@@ -1696,6 +1797,10 @@ def open_local_app(command):
         "браузер": ("browser", "https://www.google.com"),
         "гугл": ("browser", "https://www.google.com"),
         "google": ("browser", "https://www.google.com"),
+        "chrome": ("chrome", None),
+        "хром": ("chrome", None),
+        "edge": ("edge", None),
+        "эдж": ("edge", None),
         "яндекс музыка": ("shortcut", ("яндекс", "музык")),
         "яндекс музыку": ("shortcut", ("яндекс", "музык")),
         "музыка": ("shortcut", ("яндекс", "музык")),
@@ -1729,11 +1834,16 @@ def open_local_app(command):
         "дискорд": ("discord", None),
         "discord": ("discord", None),
         "телеграм": ("telegram", None),
+        "телеграмм": ("telegram", None),
         "telegram": ("telegram", None),
         "spotify": ("shortcut", ("spotify",)),
         "спотифай": ("shortcut", ("spotify",)),
         "код": ("shortcut", ("visual", "studio", "code")),
         "visual studio code": ("shortcut", ("visual", "studio", "code")),
+        "vs code": ("vscode", None),
+        "вс код": ("vscode", None),
+        "visual studio": ("visualstudio", None),
+        "висуал студио": ("visualstudio", None),
     }
     target = None
     for phrase, value in aliases.items():
@@ -1755,15 +1865,18 @@ def open_local_app(command):
     try:
         if app == "shortcut":
             shortcut = find_start_menu_shortcut(url)
+            if not shortcut and any(word in text for word in ("яндекс", "музык")):
+                shortcut = find_start_menu_shortcut(("yandex", "music"))
             if shortcut:
                 os.startfile(str(shortcut))
                 if any(word in text for word in ("музык", "music")):
                     schedule_music_playback()
                 return True, jarvis_ack(f"открываю {command}")
             if any(word in text for word in ("музык", "music")):
-                open_url(YANDEX_MUSIC_URL)
-                schedule_music_playback()
-                return True, "Ярлык не найден, открываю Яндекс Музыку в браузере."
+                if open_url(YANDEX_MUSIC_URL):
+                    schedule_music_playback()
+                    return True, "Ярлык не найден, открываю Яндекс Музыку в браузере."
+                return False, "Не удалось открыть Яндекс Музыку."
             if "xbox" in text or "иксбокс" in text or "икс бокс" in text:
                 if os.name == "nt":
                     try:
@@ -1790,6 +1903,85 @@ def open_local_app(command):
                         )
                     return True, jarvis_ack("открываю Xbox", 1)
             return False, f"Я не нашёл ярлык «{command}» в меню Пуск."
+        if app == "browser":
+            opened = open_url(url)
+            return (
+                (True, jarvis_ack(f"открываю {command}"))
+                if opened else (False, f"Не удалось открыть {command}.")
+            )
+        if app in {"chrome", "edge"}:
+            if os.name == "nt":
+                if app == "chrome":
+                    patterns = _windows_path_candidates(
+                        r"Google\Chrome\Application\chrome.exe",
+                        r"Chromium\Application\chrome.exe",
+                        r"Programs\Google\Chrome\Application\chrome.exe",
+                    )
+                    patterns += [shutil.which("chrome.exe"), shutil.which("chrome")]
+                else:
+                    patterns = _windows_path_candidates(
+                        r"Microsoft\Edge\Application\msedge.exe",
+                        r"Programs\Microsoft\Edge\Application\msedge.exe",
+                    )
+                    patterns += [shutil.which("msedge.exe"), shutil.which("msedge")]
+                executable = _first_existing_path(
+                    [candidate for candidate in patterns if candidate]
+                )
+                if executable and _launch_executable(executable):
+                    return True, jarvis_ack(f"открываю {command}")
+            return False, f"Браузер «{command}» не найден."
+        if app == "discord":
+            if os.name == "nt":
+                updater = _first_existing_path(_windows_path_candidates(
+                    r"Discord\Update.exe",
+                    r"DiscordCanary\Update.exe",
+                ))
+                if updater and _launch_executable(updater, "--processStart", "Discord.exe"):
+                    return True, jarvis_ack("открываю Discord")
+                executable = _first_existing_path(_windows_path_candidates(
+                    r"Discord\app-*\Discord.exe",
+                    r"DiscordCanary\app-*\DiscordCanary.exe",
+                ))
+                if executable and _launch_executable(executable):
+                    return True, jarvis_ack("открываю Discord")
+                if _launch_windows_store_app("Discord"):
+                    return True, jarvis_ack("открываю Discord")
+            return False, "Discord не найден среди установленных приложений."
+        if app == "telegram":
+            if os.name == "nt":
+                executable = _first_existing_path(_windows_path_candidates(
+                    r"Telegram Desktop\Telegram.exe",
+                    r"Programs\Telegram Desktop\Telegram.exe",
+                ))
+                if executable and _launch_executable(executable):
+                    return True, jarvis_ack("открываю Telegram")
+                if _launch_windows_store_app("Telegram"):
+                    return True, jarvis_ack("открываю Telegram")
+            return False, "Telegram не найден среди установленных приложений."
+        if app == "vscode":
+            if os.name == "nt":
+                executable = _first_existing_path(_windows_path_candidates(
+                    r"Programs\Microsoft VS Code\Code.exe",
+                    r"Microsoft VS Code\Code.exe",
+                ))
+                if executable and _launch_executable(executable):
+                    return True, jarvis_ack("открываю Visual Studio Code")
+            executable = shutil.which("code")
+            if executable and _launch_executable(executable):
+                return True, jarvis_ack("открываю Visual Studio Code")
+            return False, "Visual Studio Code не найден."
+        if app == "visualstudio":
+            if os.name == "nt":
+                executable = _first_existing_path([
+                    *(_windows_path_candidates(
+                        r"Microsoft Visual Studio\*\*\Common7\IDE\devenv.exe",
+                    )),
+                    shutil.which("devenv.exe"),
+                    shutil.which("devenv"),
+                ])
+                if executable and _launch_executable(executable):
+                    return True, jarvis_ack("открываю Visual Studio")
+            return False, "Visual Studio не найден."
         if app == "blender":
             executable = find_blender_executable()
             if executable:
@@ -1797,19 +1989,31 @@ def open_local_app(command):
                 return True, jarvis_ack(f"запускаю {command}", 1)
             # Blender's Steam app id is a fallback for libraries on another
             # drive that are not covered by the standard installation paths.
-            open_url("steam://rungameid/365670")
-            return True, jarvis_ack("запускаю Blender через Steam", 2)
+            if open_url("steam://rungameid/365670"):
+                return True, jarvis_ack("запускаю Blender через Steam", 2)
+            return False, "Не удалось запустить Blender через Steam."
         if url:
-            if url.startswith("http"):
-                open_url(url)
-            else:
-                open_url(url)
-            return True, jarvis_ack(f"открываю {command}")
+            opened = open_url(url)
+            return (
+                (True, jarvis_ack(f"открываю {command}"))
+                if opened else (False, f"Не удалось открыть {command}.")
+            )
         if os.name == "nt":
-            # Windows Start resolves installed apps, PATH executables, and
-            # registered file/protocol handlers (Blender, Steam games, etc.).
-            subprocess.Popen(["cmd", "/c", "start", "", app], creationflags=subprocess.CREATE_NO_WINDOW)
-            return True, jarvis_ack(f"открываю {command}")
+            # Resolve an explicit executable first.  `cmd /c start` returns
+            # success even when Windows silently fails to find the app, which
+            # used to make the AI report a false successful launch.
+            executable = shutil.which(app) or _first_existing_path(
+                _windows_path_candidates(f"{app}.exe")
+            )
+            if executable and _launch_executable(executable):
+                return True, jarvis_ack(f"открываю {command}")
+            shortcut = find_start_menu_shortcut((app,))
+            if shortcut:
+                os.startfile(str(shortcut))
+                return True, jarvis_ack(f"открываю {command}")
+            if _launch_windows_store_app(app):
+                return True, jarvis_ack(f"открываю {command}")
+            return False, f"Приложение «{command}» не найдено."
         if sys.platform == "darwin":
             subprocess.Popen(["open", "-a", app])
             return True, jarvis_ack(f"открываю {command}")
@@ -1961,6 +2165,15 @@ class AIResponder:
         self.ai_key = os.getenv("AI_API_KEY", "").strip()
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         self.mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+        self.deepseek_model = (
+            os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+            or "deepseek-chat"
+        )
+        self.mistral_model = (
+            os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
+            or "mistral-small-latest"
+        )
+        self.ai_model = os.getenv("AI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
     def _personality_instruction(self):
         enabled = os.getenv("JARVIS_VOICE_PERSONALITY", "").strip().casefold() in {
@@ -1985,12 +2198,12 @@ class AIResponder:
 
     def configuration_status(self):
         providers = []
-        if self.mistral_key:
-            providers.append("Mistral")
         if self.deepseek_key:
             providers.append("DeepSeek")
+        if self.mistral_key:
+            providers.append("Mistral")
         if self.ai_key:
-            providers.append("AI")
+            providers.append("резервный AI")
         return "Локальные API загружены: " + (", ".join(providers) if providers else "нет")
 
     def reply(self, command: str) -> str:
@@ -2012,29 +2225,33 @@ class AIResponder:
             + "Запрос пользователя: "
             + command
         )
-        remote_answer = self._remote_reply(prompt)
-        if remote_answer:
-            return self._clean_spoken_reply(remote_answer)
-        if self.mistral_key:
-            answer = self._openai_compatible(
-                "https://api.mistral.ai/v1/chat/completions",
-                self.mistral_key, prompt, model="mistral-small-latest",
-            )
-            if answer:
-                return self._clean_spoken_reply(answer)
         if self.deepseek_key:
             answer = self._openai_compatible(
                 "https://api.deepseek.com/chat/completions",
-                self.deepseek_key, prompt, model="deepseek-chat",
+                self.deepseek_key, prompt, model=self.deepseek_model,
+            )
+            if answer:
+                return self._clean_spoken_reply(answer)
+        if self.mistral_key:
+            answer = self._openai_compatible(
+                "https://api.mistral.ai/v1/chat/completions",
+                self.mistral_key, prompt, model=self.mistral_model,
             )
             if answer:
                 return self._clean_spoken_reply(answer)
         if self.ai_key:
             answer = self._openai_compatible(
-                "https://api.openai.com/v1/chat/completions", self.ai_key, prompt
+                "https://api.openai.com/v1/chat/completions",
+                self.ai_key, prompt, model=self.ai_model,
             )
             if answer:
                 return self._clean_spoken_reply(answer)
+        # A configured backend is the last fallback.  This keeps an older
+        # gateway or a weaker third model from taking precedence over the
+        # user's paid DeepSeek key.
+        remote_answer = self._remote_reply(prompt)
+        if remote_answer:
+            return self._clean_spoken_reply(remote_answer)
         # A missing key must never fall through to the prerecorded "yes"
         # folder. This local fallback is only an emergency answer.
         if "как дела" in normalized or "как ты" in normalized:
@@ -2097,6 +2314,14 @@ class AIResponder:
 
     def action_reply(self, command, technical_result):
         """Turn a successful local action into a natural spoken response."""
+        failure_markers = (
+            "не найден", "не найдена", "не найдено", "не удалось",
+            "не запущено", "ошибка", "недоступ", "не могу",
+        )
+        if any(marker in (technical_result or "").casefold() for marker in failure_markers):
+            # Never let a language model turn a failed OS operation into a
+            # confident «готово».  The diagnostic itself is more useful.
+            return technical_result
         if not (self.mistral_key or self.deepseek_key or self.ai_key):
             return technical_result
         answer = self.reply(
@@ -2121,9 +2346,9 @@ class AIResponder:
             "нумерацию. Запрос: " + request
         )
         for url, key, model in (
-            ("https://api.mistral.ai/v1/chat/completions", self.mistral_key, "mistral-small-latest"),
-            ("https://api.deepseek.com/chat/completions", self.deepseek_key, "deepseek-chat"),
-            ("https://api.openai.com/v1/chat/completions", self.ai_key, None),
+            ("https://api.deepseek.com/chat/completions", self.deepseek_key, self.deepseek_model),
+            ("https://api.mistral.ai/v1/chat/completions", self.mistral_key, self.mistral_model),
+            ("https://api.openai.com/v1/chat/completions", self.ai_key, self.ai_model),
         ):
             if key:
                 answer = self._openai_compatible(
@@ -2142,9 +2367,9 @@ class AIResponder:
             "внешних изображений, скриптов и ссылок. Запрос: " + request
         )
         for url, key, model in (
-            ("https://api.mistral.ai/v1/chat/completions", self.mistral_key, "mistral-small-latest"),
-            ("https://api.deepseek.com/chat/completions", self.deepseek_key, "deepseek-chat"),
-            ("https://api.openai.com/v1/chat/completions", self.ai_key, None),
+            ("https://api.deepseek.com/chat/completions", self.deepseek_key, self.deepseek_model),
+            ("https://api.mistral.ai/v1/chat/completions", self.mistral_key, self.mistral_model),
+            ("https://api.openai.com/v1/chat/completions", self.ai_key, self.ai_model),
         ):
             if key:
                 answer = self._openai_compatible(
@@ -2173,17 +2398,26 @@ class AIResponder:
             "Код должен быть автономным и понятным начинающему разработчику. Запрос: "
             + request
         )
-        if self.ai_key:
+        if self.deepseek_key:
             answer = self._openai_compatible(
-                "https://api.openai.com/v1/chat/completions", self.ai_key, prompt,
-                max_tokens=3000,
+                "https://api.deepseek.com/chat/completions",
+                self.deepseek_key, prompt, max_tokens=3000,
+                model=self.deepseek_model,
             )
             if answer:
                 return self._clean_code(answer)
-        if self.deepseek_key:
+        if self.mistral_key:
             answer = self._openai_compatible(
-                "https://api.deepseek.com/chat/completions", self.deepseek_key, prompt,
-                max_tokens=3000,
+                "https://api.mistral.ai/v1/chat/completions",
+                self.mistral_key, prompt, max_tokens=3000,
+                model=self.mistral_model,
+            )
+            if answer:
+                return self._clean_code(answer)
+        if self.ai_key:
+            answer = self._openai_compatible(
+                "https://api.openai.com/v1/chat/completions", self.ai_key, prompt,
+                max_tokens=3000, model=self.ai_model,
             )
             if answer:
                 return self._clean_code(answer)
@@ -2212,12 +2446,15 @@ class AIResponder:
             + "\nТекст новости:\n"
             + short_news_text(text, 900)
         )
-        for url, key in (
-            ("https://api.openai.com/v1/chat/completions", self.ai_key),
-            ("https://api.deepseek.com/chat/completions", self.deepseek_key),
+        for url, key, model in (
+            ("https://api.deepseek.com/chat/completions", self.deepseek_key, self.deepseek_model),
+            ("https://api.mistral.ai/v1/chat/completions", self.mistral_key, self.mistral_model),
+            ("https://api.openai.com/v1/chat/completions", self.ai_key, self.ai_model),
         ):
             if key:
-                answer = self._openai_compatible(url, key, prompt, max_tokens=220)
+                answer = self._openai_compatible(
+                    url, key, prompt, max_tokens=220, model=model
+                )
                 if answer:
                     return exactly_one_news_sentence(answer, title)
         return exactly_one_news_sentence(
@@ -2264,13 +2501,13 @@ class AIResponder:
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
                     "model": model or (
-                        "gpt-4o-mini" if "openai" in url else "deepseek-chat"
+                    "gpt-4o-mini" if "openai" in url else "deepseek-chat"
                     ),
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.4,
                     "max_tokens": max_tokens,
                 },
-                timeout=15,
+                timeout=25,
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"].strip()
@@ -2286,9 +2523,24 @@ class VoiceWorker:
         self.thread = None
         self.recognizer = sr.Recognizer()
         self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.65
-        self.recognizer.phrase_threshold = 0.2
-        self.recognizer.non_speaking_duration = 0.35
+        # A short pause is common inside a Russian sentence.  The old 0.65s
+        # value caused Whisper to receive half a phrase and made app names
+        # especially easy to lose.
+        try:
+            pause_threshold = float(os.getenv("JARVIS_PAUSE_THRESHOLD", "1.05"))
+        except ValueError:
+            pause_threshold = 1.05
+        self.recognizer.pause_threshold = max(0.8, min(2.0, pause_threshold))
+        self.recognizer.phrase_threshold = 0.12
+        self.recognizer.non_speaking_duration = 0.55
+        self.recognizer.dynamic_energy_adjustment_damping = 0.12
+        self.recognizer.dynamic_energy_ratio = 1.35
+        try:
+            self.phrase_time_limit = max(
+                8, min(45, int(os.getenv("JARVIS_PHRASE_TIME_LIMIT", "18")))
+            )
+        except ValueError:
+            self.phrase_time_limit = 18
         self.transcriber = SpeechTranscriber(self.recognizer, self.on_status)
         self.ai = AIResponder()
         self.voice_library = VoiceLibrary()
@@ -2964,7 +3216,11 @@ class VoiceWorker:
                 while not self.stop_event.is_set():
                     try:
                         listen_started = time.monotonic()
-                        audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=8)
+                        audio = self.recognizer.listen(
+                            source,
+                            timeout=1,
+                            phrase_time_limit=self.phrase_time_limit,
+                        )
                         heard = self.transcriber.transcribe(audio).strip()
                         wake_found, wake_command = extract_wake_command(heard)
                         # Recognition is a network operation.  If Google
@@ -3075,8 +3331,11 @@ class VoiceWorker:
                             app_name = command.lower()
                             for word in ("закрой", "закрыть", "выключи", "выключить", "приложение"):
                                 app_name = app_name.replace(word, "").strip()
-                            _, reply = close_local_app(app_name)
-                            self.say(self.ai.action_reply(command, reply), category)
+                            closed, reply = close_local_app(app_name)
+                            self.say(
+                                self.ai.action_reply(command, reply) if closed else reply,
+                                category if closed else None,
+                            )
                         elif any(word in command.lower() for word in (
                             "открой", "запусти", "запустить", "открыть",
                             "включи", "найди", "поищи", "поиск",
@@ -3086,8 +3345,8 @@ class VoiceWorker:
                             if not any(word in app_name for word in ("включи", "найди", "поищи", "поиск")):
                                 for word in ("открой", "запусти", "запустить", "открыть", "приложение"):
                                     app_name = app_name.replace(word, "").strip()
-                            _, reply = open_local_app(app_name)
-                            if is_general_web_search(command):
+                            opened, reply = open_local_app(app_name)
+                            if is_general_web_search(command) and opened:
                                 # Search confirmation comes from the user's
                                 # saved blagodar recordings. The found title
                                 # and snippet are a separate generated speech
@@ -3102,9 +3361,13 @@ class VoiceWorker:
                                     self.ai.search_reply(command, reply),
                                     None,
                                 )
-                            else:
+                            elif opened:
                                 self.say(self.ai.action_reply(command, reply), category)
-                            if media_command(command):
+                            else:
+                                # A failed launch must remain visible as a
+                                # failure; never ask an LLM to beautify it.
+                                self.say(reply, None)
+                            if opened and media_command(command):
                                 self.arm_auto_tik_tok(command)
                         else:
                             # Never use a prerecorded confirmation for a
@@ -3533,14 +3796,28 @@ class App(tk.Tk):
         try:
             recognizer = sr.Recognizer()
             recognizer.dynamic_energy_threshold = True
-            recognizer.pause_threshold = 0.65
-            recognizer.phrase_threshold = 0.2
-            recognizer.non_speaking_duration = 0.35
+            try:
+                pause_threshold = float(os.getenv("JARVIS_PAUSE_THRESHOLD", "1.05"))
+            except ValueError:
+                pause_threshold = 1.05
+            recognizer.pause_threshold = max(0.8, min(2.0, pause_threshold))
+            recognizer.phrase_threshold = 0.12
+            recognizer.non_speaking_duration = 0.55
+            recognizer.dynamic_energy_adjustment_damping = 0.12
+            recognizer.dynamic_energy_ratio = 1.35
             transcriber = SpeechTranscriber(recognizer, self.set_status)
             with sr.Microphone(device_index=device_index) as source:
                 self.set_status("Проверка микрофона: скажите что-нибудь…")
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = recognizer.listen(source, timeout=4, phrase_time_limit=4)
+                try:
+                    phrase_time_limit = max(
+                        8, min(45, int(os.getenv("JARVIS_PHRASE_TIME_LIMIT", "18")))
+                    )
+                except ValueError:
+                    phrase_time_limit = 18
+                audio = recognizer.listen(
+                    source, timeout=4, phrase_time_limit=phrase_time_limit
+                )
             text = transcriber.transcribe(audio)
             self.set_status(f"Микрофон работает: «{text}»")
         except sr.WaitTimeoutError:

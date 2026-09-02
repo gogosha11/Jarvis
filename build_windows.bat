@@ -19,7 +19,14 @@ if exist "dist" rmdir /s /q "dist"
 if exist "build" rmdir /s /q "build"
 
 set "SECRET_OPTION="
-if exist "jarvis_secrets.dat" set "SECRET_OPTION=--add-data jarvis_secrets.dat;."
+if exist ".env" (
+  ".buildenv\Scripts\python.exe" embed_secrets.py .env jarvis_secrets.dat
+  set "SECRET_OPTION=--add-data jarvis_secrets.dat;."
+) else if exist "jarvis_secrets.dat" (
+  set "SECRET_OPTION=--add-data jarvis_secrets.dat;."
+) else (
+  echo ВНИМАНИЕ: .env не найден. Сборка будет без AI-ключей.
+)
 
 ".buildenv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm --clean --onedir --windowed ^
@@ -39,7 +46,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Pa
 echo.
 echo Готово: dist\Jarvis\Jarvis.exe
 echo Архив для GitHub Release: dist\Jarvis-windows.zip
-if not exist "jarvis_secrets.dat" echo ВНИМАНИЕ: jarvis_secrets.dat не найден, AI-ключи в сборку не добавлены.
+if exist "jarvis_secrets.dat" del /q "jarvis_secrets.dat"
 echo Папку voise положите в dist\Jarvis рядом с EXE, если она у вас есть.
-echo API-ключи не копируются в dist: Jarvis использует Railway backend.
+echo GROQ_API_KEY и другие ключи не попадают в GitHub автоматически.
+echo Если рядом есть .env, ключи зашифрованно встраиваются в личную сборку.
 pause

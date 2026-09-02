@@ -5,7 +5,7 @@ a = Analysis(
     ['jarvis_entry.py'],
     pathex=[],
     binaries=[],
-    datas=[('app.py', '.'), ('jarvis.ico', '.')],
+    datas=[('app.py', '.'), ('jarvis_secrets.dat', '.'), ('jarvis.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
